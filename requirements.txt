@@ -1,0 +1,12 @@
+pandas
+numpy
+openmeteo-requests
+requests-cache
+retry-requests
+supabase
+python-dotenv
+scikit-learn
+xgboost 
+tensorflow 
+joblib 
+scikit-learn
