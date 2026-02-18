@@ -1,33 +1,28 @@
-import pandas as pd
-import numpy as np
-import joblib
-import json
 import os
 import sys
-
-# Metrics & Selection
+import json
+import joblib
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from datetime import datetime
+from pytz import timezone
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-
-# Models
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 
-# Deep Learning (TensorFlow/Keras)
-import tensorflow as tf
-
-# Utils (Importing your Supabase client)
+# Add parent directory to path to import utils
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-from src.utils.db_client import fetch_training_data, upload_model_to_registry
+from src.utils.db_client import fetch_training_data, upload_model_to_registry, download_model_from_registry
 
-# --- CONFIGURATION ---
+# Configuration
 TARGET = 'aqi'
-# Inputs: Pollutants + Derived Time Features + Lags
 FEATURES = [
-    'pm2_5', 'pm10', 'nitrogen_dioxide', 'carbon_monoxide', 'sulphur_dioxide', 'ozone', 'dust',
-    'pm2_5_lag1', 'pm2_5_lag24', 'pm2_5_rolling_24h', 
-    'hour', 'day_of_week', 'month'
+    'pm10', 'pm2_5', 'carbon_monoxide', 'nitrogen_dioxide', 'sulphur_dioxide', 'ozone', 'dust',
+    'hour', 'day_of_week', 'month',
+    'pm2_5_lag1', 'pm2_5_lag24', 'pm10_lag1', 'pm10_lag24', 'aqi_change_rate',
+    'pm2_5_rolling_24h', 'pm2_5_rolling_7d', 'pm10_rolling_24h', 'pm10_rolling_7d'
 ]
 
 def calculate_metrics(name, y_true, y_pred):
@@ -45,41 +40,6 @@ def calculate_metrics(name, y_true, y_pred):
     
     return {"model": name, "mae": mae, "rmse": rmse, "r2": r2}
 
-def train_lstm_model(X_train, y_train, X_test, y_test):
-    """
-    Trains an LSTM (Long Short-Term Memory) Neural Network.
-    Required for the 'Deep Learning' constraint in the project docs.
-    """
-    # Reshape input to [samples, time_steps, features]
-    X_train_rs = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
-    X_test_rs = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
-    
-    model = tf.keras.models.Sequential([
-        tf.keras.layers.LSTM(64, return_sequences=True, input_shape=(1, X_train.shape[1])),
-        tf.keras.layers.Dropout(0.2),
-        tf.keras.layers.LSTM(32),
-        tf.keras.layers.Dropout(0.1),
-        tf.keras.layers.Dense(1)
-    ])
-    
-    model.compile(optimizer='adam', loss='mse')
-    
-    # Early stopping prevents overfitting
-    early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-    
-    print("\n🧠 Training LSTM Deep Learning Model...")
-    history = model.fit(
-        X_train_rs, y_train, 
-        epochs=50, 
-        batch_size=32, 
-        validation_data=(X_test_rs, y_test),
-        callbacks=[early_stop],
-        verbose=1
-    )
-    
-    y_pred = model.predict(X_test_rs).flatten()
-    return model, y_pred
-
 if __name__ == "__main__":
     print("--- STARTING DAILY TRAINING PIPELINE ---")
     
@@ -87,11 +47,28 @@ if __name__ == "__main__":
     print("Fetching training data...")
     df = fetch_training_data(table_name="feature_store")
     
+    # Ensure 'date' is the index and is datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        
+    # Standardize to Karachi Time
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+    df.index = df.index.tz_convert('Asia/Karachi')
+    
     # Sort by time is CRITICAL for forecasting
-    df.sort_index(inplace=True)
+    df.sort_index(ascending=True, inplace=True)
     
     # Drop NaNs created by lag features
     df.dropna(subset=FEATURES, inplace=True)
+    
+    # --- ADD THESE 3 LINES FOR TRUE FORECASTING ---
+    # Shift the target so the model learns to predict 24 hours into the future
+    df['target_aqi_24h_ahead'] = df['aqi'].shift(-24)
+    df.dropna(inplace=True) # Drop the last 24 rows which now have NaN targets
+    
+    TARGET = 'target_aqi_24h_ahead' # Update the target variable
     
     print(f"Training on {len(df)} rows of data.")
     
@@ -113,21 +90,52 @@ if __name__ == "__main__":
 
     # --- MODEL A: Random Forest (Baseline) ---
     print("\n🌲 Training Random Forest...")
-    rf = RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42)
-    rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
+    rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+    rf.fit(X_train_scaled, y_train)
+    y_pred_rf = rf.predict(X_test_scaled)
     results.append(calculate_metrics("Random Forest", y_test, y_pred_rf))
 
     # --- MODEL B: XGBoost (Gradient Boosting) ---
     print("\n🚀 Training XGBoost...")
     xgb = XGBRegressor(n_estimators=200, learning_rate=0.05, max_depth=5, random_state=42)
-    xgb.fit(X_train, y_train)
-    y_pred_xgb = xgb.predict(X_test)
+    xgb.fit(X_train_scaled, y_train)
+    y_pred_xgb = xgb.predict(X_test_scaled)
     results.append(calculate_metrics("XGBoost", y_test, y_pred_xgb))
 
-    # --- MODEL C: LSTM (Deep Learning) ---
-    lstm, y_pred_lstm = train_lstm_model(X_train_scaled, y_train, X_test_scaled, y_test)
-    results.append(calculate_metrics("LSTM", y_test, y_pred_lstm))
+    # --- 3. Deep Learning (LSTM) ---
+    print("\nTraining Deep Learning LSTM...")
+    
+    # A. Scale the Target Variable (Crucial for Neural Networks!)
+    y_scaler = MinMaxScaler()
+    y_train_scaled = y_scaler.fit_transform(y_train.values.reshape(-1, 1))
+    y_test_scaled = y_scaler.transform(y_test.values.reshape(-1, 1))
+    
+    # B. Reshape for LSTM [samples, time_steps, features]
+    X_train_lstm = X_train_scaled.reshape((X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
+    X_test_lstm = X_test_scaled.reshape((X_test_scaled.shape[0], 1, X_test_scaled.shape[1]))
+
+    # C. Stable Architecture (Removed 'relu' from LSTM layers, using default 'tanh')
+    lstm = tf.keras.models.Sequential([
+        tf.keras.layers.LSTM(64, return_sequences=True, input_shape=(1, X_train_scaled.shape[1])),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.LSTM(32),
+        tf.keras.layers.Dense(16, activation='relu'),
+        tf.keras.layers.Dense(1, activation='linear') # Linear output for regression
+    ])
+    
+    lstm.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mse')
+    early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+    # D. Train on SCALED target
+    lstm.fit(X_train_lstm, y_train_scaled, epochs=50, batch_size=32, 
+             validation_data=(X_test_lstm, y_test_scaled), callbacks=[early_stop], verbose=0)
+
+    # E. Predict and INVERSE TRANSFORM back to real AQI values
+    lstm_preds_scaled = lstm.predict(X_test_lstm, verbose=0)
+    lstm_preds = y_scaler.inverse_transform(lstm_preds_scaled).flatten()
+
+    # F. Evaluate on real AQI values
+    results.append(calculate_metrics("LSTM", y_test, lstm_preds))
 
     # 4. Compare and Select Winner
     # We select the model with the LOWEST RMSE
@@ -141,31 +149,49 @@ if __name__ == "__main__":
     joblib.dump(scaler, "models/scaler.pkl")
     upload_model_to_registry("models/scaler.pkl", "scaler.pkl")
     
-    # B. Save the Best Model
-    if best_model_stats['model'] == "Random Forest":
-        joblib.dump(rf, "models/best_model.pkl")
-        model_ext = ".pkl"
-    elif best_model_stats['model'] == "XGBoost":
-        joblib.dump(xgb, "models/best_model.pkl")
-        model_ext = ".pkl"
+    # Save Target Scaler (Needed for LSTM in Dashboard)
+    joblib.dump(y_scaler, "models/y_scaler.pkl")
+    upload_model_to_registry("models/y_scaler.pkl", "y_scaler.pkl")
+    
+    # B. Save ALL Models (So user can switch in Dashboard)
+    print("Saving all models...")
+    
+    # Random Forest
+    joblib.dump(rf, "models/rf_model.pkl", compress=3)
+    upload_model_to_registry("models/rf_model.pkl", "rf_model.pkl")
+    
+    # XGBoost
+    joblib.dump(xgb, "models/xgb_model.pkl", compress=3)
+    upload_model_to_registry("models/xgb_model.pkl", "xgb_model.pkl")
+    
+    # LSTM
+    lstm.save("models/lstm_model.h5")
+    upload_model_to_registry("models/lstm_model.h5", "lstm_model.h5")
+
+    # C. Update History (Append mode)
+    print("Updating Training History...")
+    history_file = "models/training_history.json"
+    
+    # Try to download existing history, else start new
+    if download_model_from_registry("training_history.json") is None:
+        history = []
     else:
-        # Keras model saving
-        lstm.save("models/best_model.h5")
-        model_ext = ".h5"
+        with open(history_file, "r") as f:
+            history = json.load(f)
+            
+    # Append today's results
+    new_entry = {
+        "date": datetime.now(timezone('Asia/Karachi')).strftime("%Y-%m-%d %H:%M:%S"),
+        "winner": best_model_stats['model'],
+        "results": results
+    }
+    history.append(new_entry)
+    
+    with open(history_file, "w") as f:
+        json.dump(history, f, indent=4)
         
-    # C. Save Metrics (For Reporting/Analysis)
-    with open("models/metrics.json", "w") as f:
-        json.dump(results, f, indent=4)
-        
-    # 6. Push to Supabase Registry
-    # We rename it to generic 'best_model' so the Web App doesn't need to know which algo won.
-    print(f"Uploading {best_model_stats['model']} to Registry...")
-    upload_model_to_registry(f"models/best_model{model_ext}", f"best_model{model_ext}")
+    upload_model_to_registry(history_file, "training_history.json")
     
     print("--- TRAINING PIPELINE COMPLETE ---")
     
     
-    # --- ADD THIS NEW LINE ---
-    upload_model_to_registry("models/metrics.json", "metrics.json")
-    
-    print("--- TRAINING PIPELINE COMPLETE ---")

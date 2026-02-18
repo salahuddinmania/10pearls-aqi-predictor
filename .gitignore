@@ -1,13 +1,22 @@
-# Python Virtual Environment
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
 myenv/
 venv/
 env/
-__pycache__/
-*.pyc
 
-# Environment Variables (Secrets)
+# Environment Variables (NEVER COMMIT THIS)
 .env
-.DS_Store
 
-# IDE settings
+# Model Artifacts (Too large for Git, fetch from Registry instead)
+models/*.pkl
+models/*.h5
+models/*.json
+!models/.gitkeep
+
+# IDE & OS
 .vscode/
+.DS_Store

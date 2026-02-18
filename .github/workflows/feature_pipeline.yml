@@ -28,5 +28,4 @@ jobs:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       run: |
-        # Run without 'backfill' argument implies incremental update (3 days)
         python src/features/feature_pipeline.py

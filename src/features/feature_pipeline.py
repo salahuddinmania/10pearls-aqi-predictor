@@ -1,5 +1,5 @@
 import openmeteo_requests
-import requests_cache
+import requests
 import pandas as pd
 import numpy as np
 from retry_requests import retry
@@ -18,15 +18,12 @@ LON = 67.0011
 FEATURE_COLS = ['pm10', 'pm2_5', 'carbon_monoxide', 'nitrogen_dioxide', 'sulphur_dioxide', 'ozone', 'dust']
 
 def fetch_weather_data(days_back=180):
-    """
-    Fetches hourly AQI data. 
-    Default: 180 days (6 Months) as per Project Requirements.
-    """
+    """Fetches hourly AQI data from Open-Meteo API."""
     print(f"Fetching data for the last {days_back} days...")
     
-    # Setup Open-Meteo client with caching
-    cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    # Setup Open-Meteo client
+    session = requests.Session()
+    retry_session = retry(session, retries=5, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
     url = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -56,91 +53,93 @@ def fetch_weather_data(days_back=180):
         )
     }
 
-    for i, col in enumerate(FEATURE_COLS + ["aqi"]):
-        hourly_data[col] = hourly.Variables(i).ValuesAsNumpy()
+    # Map API response variables to our DataFrame columns
+    api_vars = FEATURE_COLS + ["us_aqi"]
+    for i, var_name in enumerate(api_vars):
+        col_name = "aqi" if var_name == "us_aqi" else var_name
+        hourly_data[col_name] = hourly.Variables(i).ValuesAsNumpy()
 
     df = pd.DataFrame(data=hourly_data)
     df.set_index('date', inplace=True)
+    
+    # Convert to Karachi Time (PKT)
+    df.index = df.index.tz_convert('Asia/Karachi')
     return df
 
 def clean_data(df):
-    """
-    Applies Enterprise Cleaning verified in EDA.
-    1. Interpolation
-    2. Negative Value Removal
-    3. Outlier Capping (Winsorization)
-    """
+    """Applies data cleaning: interpolation, smoothing, and outlier capping."""
     print("Starting Data Cleaning...")
     
     # 1. Fill Missing Values
     df.interpolate(method='linear', inplace=True)
+    df.fillna(df.mean(), inplace=True)
     
-    # 2. Force Negatives to 0 (Physically impossible)
-    df[df < 0] = 0
-    
-    # 3. Cap Outliers (1st - 99th Percentile Rule)
-    # We do NOT cap the target 'aqi', only input features.
+    # 2. Noise Smoothing (3-hour rolling average)
     for col in FEATURE_COLS:
-        lower = df[col].quantile(0.01)
-        upper = df[col].quantile(0.99)
-        df[col] = df[col].clip(lower=lower, upper=upper)
+        df[f'{col}_smoothed'] = df[col].rolling(window=3, min_periods=1).mean()
+    
+    # 3. Cap Outliers using IQR on Smoothed Data
+    for col in FEATURE_COLS:
+        series = df[f'{col}_smoothed']
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
+        IQR = Q3 - Q1
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+        df[col] = series.clip(lower=lower, upper=upper)
+        
+    df.drop(columns=[f'{col}_smoothed' for col in FEATURE_COLS], inplace=True)
+    
+    # 4. Force Negatives to 0
+    df[df < 0] = 0
         
     print("Data Cleaning Complete.")
     return df
 
 def feature_engineering(df):
-    """
-    Generates derived features as required by Project Docs (Source 31).
-    """
+    """Generates derived features for model training."""
     print("Starting Feature Engineering...")
     
-    # 1. Time-Based Features
+    # Log Transform for Skewed Features
+    for col in ['nitrogen_dioxide', 'dust']:
+        df[col] = np.log1p(df[col])
+    
+    # Time-Based Features
     df['hour'] = df.index.hour
     df['day_of_week'] = df.index.dayofweek
     df['month'] = df.index.month
     
-    # 2. Lag Features (History) - Crucial for Forecasting
-    # "What was the PM2.5 level 1 hour ago? 24 hours ago?"
-    for col in ['pm2_5', 'pm10', 'nitrogen_dioxide']:
-        df[f'{col}_lag1'] = df[col].shift(1)   # Previous Hour
-        df[f'{col}_lag24'] = df[col].shift(24) # Previous Day
+    # Lag Features
+    for col in ['pm2_5', 'pm10']:
+        df[f'{col}_lag1'] = df[col].shift(1)
+        df[f'{col}_lag24'] = df[col].shift(24)
         
-    # 3. Rolling Window Features (Trends)
-    # "What was the average AQI over the last 24 hours?"
-    df['pm2_5_rolling_24h'] = df['pm2_5'].rolling(window=24).mean()
+    # Rolling Window Features
+    for col in ['pm2_5', 'pm10']:
+        df[f'{col}_rolling_24h'] = df[col].rolling(window=24, min_periods=1).mean()
+        df[f'{col}_rolling_7d'] = df[col].rolling(window=24*7, min_periods=1).mean()
+        
+    # AQI Change Rate (Derivative)
+    df['aqi_change_rate'] = df['aqi'].shift(1).diff()
     
-    # 4. Drop NaN values created by shifting/rolling
     df.dropna(inplace=True)
     
     print(f"Feature Engineering Complete. Final Columns: {df.shape[1]}")
     return df
 
 if __name__ == "__main__":
-    # --- ENTERPRISE PIPELINE EXECUTION ---
-    
-    # CLI Argument to control Backfill vs Update
-    # Usage: python src/features/feature_pipeline.py backfill
     mode = "update"
+    days = 3
+    
     if len(sys.argv) > 1 and sys.argv[1] == "backfill":
         mode = "backfill"
-        days = 180 # 6 Months [Requirement Check: PASSED]
-    else:
-        days = 3   # Standard Incremental Update
+        days = 180
         
     print(f"--- RUNNING PIPELINE (Mode: {mode} | Days: {days}) ---")
     
-    # 1. Fetch
     raw_df = fetch_weather_data(days_back=days)
-    
-    # 2. Clean
     clean_df = clean_data(raw_df)
-    
-    # 3. Engineer Features (New Step)
     final_df = feature_engineering(clean_df)
-    
-    # 4. Push to Feature Store
-    # Note: Ensure your Supabase table has columns for the new features 
-    # (hour, day_of_week, pm2_5_lag1, etc.) or uses JSONB.
     push_features_to_store(final_df, table_name="feature_store")
     
     print("--- PIPELINE SUCCESS ---")
