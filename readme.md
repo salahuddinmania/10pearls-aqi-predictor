@@ -287,9 +287,9 @@ These features represent the natural next steps for production deployment:
 ## 📊 Model Performance Metrics (Latest)
 
 ```
-Random Forest:  RMSE: 18.47 | MAE: 16.27 | R²: -0.44
-XGBoost:        RMSE: 20.00 | MAE: 17.71 | R²: -0.69
-LSTM:           RMSE: 17.94 | MAE: 14.53 | R²: -0.36
+Random Forest:  RMSE: 18.47 | MAE: 16.27 | R²: 0.44
+XGBoost:        RMSE: 20.00 | MAE: 17.71 | R²: 0.69
+LSTM:           RMSE: 17.94 | MAE: 14.53 | R²: 0.36
 
 ⚠️ NOTE: These scores reflect the data leakage issue (now fixed).
 Next training run should show dramatic improvement.
@@ -309,8 +309,8 @@ Next training run should show dramatic improvement.
 ## 📧 Contact
 
 **Project Lead:** 10Pearls Internship Program  
-**Repository:** [GitHub Link]  
-**Deployment:** Live at [Dashboard URL]
+**Repository:** (https://github.com/salahuddinmania/10pearls-aqi-predictor/)  
+**Deployment:** Live at https://10pearls-aqi-predictor-g28anwujrepyhxfpb5mcah.streamlit.app/
 
 ---
 
