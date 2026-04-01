@@ -3,7 +3,6 @@ from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
 import pandas as pd
 
-# Load environment variables
 load_dotenv()
 
 url: str = os.environ.get("SUPABASE_URL")
@@ -12,42 +11,46 @@ key: str = os.environ.get("SUPABASE_KEY")
 if not url or not key:
     raise ValueError("Supabase credentials not found. Check your .env file.")
 
+if not url.endswith('/'):
+    url += '/'
+
 def get_supabase_client() -> Client:
-    """Returns an authenticated Supabase client with extended timeouts."""
     return create_client(url, key, options=ClientOptions(
-        postgrest_client_timeout=300, storage_client_timeout=300
+        postgrest_client_timeout=600, storage_client_timeout=600
     ))
 
-def push_features_to_store(df, table_name="feature_store"):
-    """Pushes a Pandas DataFrame to Supabase Feature Store."""
+def push_features_to_store(df, table_name="feature_store", chunk_size=250):
     supabase = get_supabase_client()
     
-    # Prepare data for JSON serialization
     data = df.reset_index()
     data['timestamp'] = data['date'].astype(str)
     data = data.drop(columns=['date'])
     
-    records = data.to_dict(orient='records')
-    
-    try:
-        response = supabase.table(table_name).upsert(records).execute()
-        print(f"Success! {len(records)} rows pushed to {table_name}.")
-        return response
-    except Exception as e:
-        print(f"Error pushing to Supabase: {e}")
+    total_rows = len(data)
+    num_batches = (total_rows // chunk_size) + (1 if total_rows % chunk_size > 0 else 0)
+
+    for i in range(0, total_rows, chunk_size):
+        chunk = data.iloc[i:i + chunk_size]
+        records = chunk.to_dict(orient='records')
         
+        try:
+            print(f"📤 Uploading batch {i//chunk_size + 1}/{num_batches}...")
+            supabase.table(table_name).upsert(records).execute()
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return
+            
+    print(f"✅ {total_rows} rows uploaded to {table_name}")
+
 def fetch_training_data(table_name="feature_store"):
-    """Fetches latest training data from Supabase."""
     supabase = get_supabase_client()
-    
-    # Fetch latest 5000 rows
     response = supabase.table(table_name).select("*").order("timestamp", desc=True).limit(5000).execute()
-    data = response.data
     
-    if not data:
-        raise ValueError("No data found in Feature Store!")
+    if not hasattr(response, 'data') or not response.data:
+        print("⚠️ No data found in Feature Store")
+        return pd.DataFrame()
         
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(response.data)
     
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -56,9 +59,7 @@ def fetch_training_data(table_name="feature_store"):
     return df
 
 def upload_model_to_registry(file_path, file_name, bucket="model-registry"):
-    """Uploads a model artifact to Supabase Storage."""
     supabase = get_supabase_client()
-    
     try:
         with open(file_path, 'rb') as f:
             supabase.storage.from_(bucket).upload(
@@ -66,13 +67,12 @@ def upload_model_to_registry(file_path, file_name, bucket="model-registry"):
                 file=f.read(),
                 file_options={"cache-control": "3600", "upsert": "true"}
             )
-        print(f"✅ Model saved to Registry: {file_name}")
+        print(f"✅ {file_name} saved")
     except Exception as e:
-        print(f"❌ Error uploading model: {e}")
+        print(f"❌ Error uploading {file_name}: {e}")
             
             
 def download_model_from_registry(file_name, bucket="model-registry"):
-    """Downloads a model artifact from Supabase Storage."""
     supabase = get_supabase_client()
     local_path = os.path.join("models", file_name)
     os.makedirs("models", exist_ok=True)
@@ -81,7 +81,7 @@ def download_model_from_registry(file_name, bucket="model-registry"):
         with open(local_path, 'wb') as f:
             response = supabase.storage.from_(bucket).download(file_name)
             f.write(response)
-        print(f"✅ Downloaded {file_name} from Registry.")
+        print(f"✅ Downloaded {file_name}")
         return local_path
     except Exception as e:
         print(f"❌ Error downloading {file_name}: {e}")
